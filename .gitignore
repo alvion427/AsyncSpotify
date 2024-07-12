@@ -1,4 +1,5 @@
 .idea
+.spotify_auth_token
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

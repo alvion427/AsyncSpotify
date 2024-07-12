@@ -4,18 +4,19 @@
 #  You are not allowed to use this code or this file for another project without                   #
 #  linking to the original source.                                                                 #
 # ##################################################################################################
-
+import asyncio
 import base64
 import json
 import time
 import webbrowser
+import os
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Optional, List, Union
 from urllib import parse
 from urllib.parse import urlencode
 
-from aiohttp import ClientSession, TraceConfig, TraceRequestRedirectParams, ClientConnectorError
+from aiohttp import ClientSession, TraceConfig, TraceRequestRedirectParams, ClientConnectorError, web
 
 from ._api_request_maker import ApiRequestHandler
 from ._endpoints.albums import Albums
@@ -193,6 +194,83 @@ class SpotifyApiClient:
 
         # Open url in a new window of the default browser, if possible
         webbrowser.open_new(self.build_authorization_url(show_dialogue))
+
+    async def load_auth_file(self, auth_file: str = ".spotify_auth_token"):
+        """
+        Load the auth token from a file if it exists, otherwise return None
+        """
+        if os.path.exists(auth_file):
+            with open(auth_file, 'r') as f:
+                token = json.load(f)
+            return token
+        return None
+
+    async def get_or_load_auth_token(self, redirect_uri: str, auth_file: str = ".spotify_auth_token"):
+        """
+        Start a local web server to capture the Spotify authorization code and save the resulting token to a file.
+
+        Args:
+            redirect_uri: The redirect URI configured in the Spotify app settings.
+            auth_file: The file path to save the authorization token.
+        """
+        # Try to load existing token
+        existing_token = await self.load_auth_file(auth_file)
+        if existing_token:
+            token =  SpotifyAuthorisationToken(**existing_token)
+            try:
+                # Attempt to refresh the token
+                refreshed_token = await self.refresh_token(token)
+                # Save the refreshed token
+                with open(auth_file, 'w') as f:
+                    json.dump(refreshed_token.__dict__, f, indent=2)
+                return refreshed_token
+            except SpotifyError:
+                # If refresh fails, proceed with new authorization
+                pass
+
+        # Extract port from redirect URI
+        port = int(parse.urlparse(redirect_uri).port)
+
+        # Create a web server to capture the authorization code
+        auth_code = None
+
+        # Create a web server to capture the authorization code
+        async def handle(request):
+            nonlocal auth_code
+            code = request.query.get('code')
+            if code:
+                auth_code = code
+                return web.Response(text="Authorization successful! You can close this window.")
+            return web.Response(text="Authorization failed!")
+
+        app = web.Application()
+        app.router.add_get('/{tail:.*}', handle)  # Handle all paths
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, 'localhost', port)
+        await site.start()
+
+        # Open the browser to authorize Spotify
+        self.open_oauth_dialog_in_browser()
+
+        # Keep the server running until the authorization is complete
+        while not auth_code:
+            await asyncio.sleep(1)
+
+        await runner.cleanup()
+
+        # Get the auth token using the captured code
+        token = await self.get_auth_token_with_code(auth_code)
+
+        # Save the token to a file
+        with open(auth_file, 'w') as f:
+            json.dump(token.__dict__, f, indent=2)
+
+        return token
+        
+
+        
 
     async def get_code_with_cookie(self, cookies: SpotifyCookie) -> str:
         """
